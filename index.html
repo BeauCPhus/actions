@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Actions App Reference — R3</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:light dark}
+body{max-width:980px;margin:auto;padding:18px}
+header{position:sticky;top:0;background:Canvas;padding:10px 0 14px;border-bottom:1px solid GrayText;z-index:2}
+h1{font-size:1.4rem;margin:0 0 10px}
+.controls{display:flex;gap:8px;flex-wrap:wrap}
+input{flex:1;min-width:220px;padding:10px;font-size:1rem}
+button{padding:10px 12px}
+#status{font-size:.85rem;opacity:.7;margin-top:8px}
+.action{border-bottom:1px solid color-mix(in srgb, CanvasText 15%, transparent)}
+.action summary{padding:15px 4px;font-size:1.05rem;font-weight:650;cursor:pointer}
+.action-body{padding:0 8px 18px 24px}
+.desc{white-space:pre-wrap;line-height:1.4}
+.meta{font-size:.9rem;margin-top:9px}
+.label{font-weight:650}
+.usecase{margin-top:16px;padding:12px 14px;border-left:3px solid CanvasText;background:color-mix(in srgb, CanvasText 5%, Canvas);border-radius:0 7px 7px 0;line-height:1.4}
+.usecase-title{font-weight:700;margin-bottom:6px}
+.usecase p{margin:6px 0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88em}
+.entry-title{font-weight:700;margin-top:18px;margin-bottom:8px}
+.entries{display:grid;gap:8px}
+.entry{padding:10px 12px;border:1px solid color-mix(in srgb, CanvasText 14%, transparent);border-radius:8px;background:color-mix(in srgb, CanvasText 3%, Canvas)}
+.entry-head{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.entry-name{font-weight:700}
+.entry-type{font-size:.82rem;opacity:.68}
+.entry-desc{margin-top:5px;line-height:1.38}
+.entry-extra{margin-top:5px;font-size:.88rem;opacity:.82}
+.source-note{font-size:.78rem;opacity:.62;margin-top:5px}
+.enrich-status{font-size:.78rem;opacity:.62;margin-top:10px}
+.loading-note{font-size:.88rem;opacity:.7;font-style:italic}
+
+</style>
+</head>
+<body>
+<header>
+<h1>Actions App — Shortcuts Action Reference <small style="font-size:.65em;opacity:.6">R3</small></h1>
+<div class="controls">
+<input id="q" type="search" placeholder="Search actions, descriptions, parameters, use cases…" autofocus>
+<button id="json">Export JSON</button>
+<button id="reload">Reload Source</button>
+</div>
+<div id="status">Loading current Actions reference…</div>
+</header>
+<main id="list"></main>
+<script>
+const SOURCE='https://gist.githubusercontent.com/sindresorhus/fbba65a774fb9da915e624807a02a6d2/raw/actions.md';
+const FORK_REPO='kingfive/Actions';
+const FORK_BRANCH='main';
+const FORK_DIRS=['Shared/Actions','Intents Extension/Actions'];
+let actions=[];
+let forkFiles=null;
+const enrichmentCache=new Map();
+
+function parse(md){
+  const chunks=md.split(/^## /m).slice(1);
+  return chunks.map(chunk=>{
+    const lines=chunk.split('\n');
+    const title=lines.shift().trim();
+    let section='description', desc=[], params=[], returns=[];
+    for(const line of lines){
+      if(/^### Parameters/.test(line)){section='params';continue}
+      if(/^### Returns/.test(line)){section='returns';continue}
+      if(/^### /.test(line)){section='description';continue}
+      if(section==='params' && /^\s*\*\s+/.test(line)) params.push(line.replace(/^\s*\*\s+/,'').replace(/`/g,''));
+      else if(section==='returns' && line.trim() && !/^\s*\*\s*\*\s*\*/.test(line)) returns.push(line.trim().replace(/`/g,''));
+      else if(section==='description' && !/^\s*\*\s*\*\s*\*/.test(line)) desc.push(line);
+    }
+    return {
+      title,
+      description: desc.join('\n').trim().replace(/\n{3,}/g,'\n\n'),
+      parameters: params,
+      returns: returns.join(' ').trim() || null
+    };
+  });
+}
+
+function esc(s=''){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+
+function norm(s=''){
+  return s.toLowerCase().replace(/[^a-z0-9]+/g,'');
+}
+
+function splitParam(p){
+  // Current actions.md format: **Name** (Type), after Markdown markers have been stripped.
+  const m=p.match(/^\*{0,2}\s*(.*?)\s*\*{0,2}\s*\((.+)\)\s*$/);
+  if(m) return {name:m[1].replace(/\*/g,'').trim(),type:m[2].trim()};
+  const clean=p.replace(/\*/g,'').trim();
+  return {name:clean,type:''};
+}
+
+function unquoteSwift(s=''){
+  return s.replace(/\\"/g,'"').replace(/\\n/g,'\n').replace(/\\\\/g,'\\');
+}
+
+function balancedParameterBlocks(swift){
+  const out=[];
+  let pos=0;
+  while((pos=swift.indexOf('@Parameter(',pos))!==-1){
+    const start=pos+11;
+    let i=start,depth=1,inString=false,escape=false;
+    for(;i<swift.length;i++){
+      const c=swift[i];
+      if(inString){
+        if(escape){escape=false;continue}
+        if(c==='\\'){escape=true;continue}
+        if(c==='"') inString=false;
+        continue;
+      }
+      if(c==='"'){inString=true;continue}
+      if(c==='(') depth++;
+      else if(c===')'){
+        depth--;
+        if(depth===0) break;
+      }
+    }
+    const args=swift.slice(start,i);
+    const tail=swift.slice(i+1,i+260);
+    const vm=tail.match(/^\s*var\s+([A-Za-z0-9_]+)\s*:\s*([^\n={]+)/);
+    if(vm) out.push({args,varName:vm[1],swiftType:vm[2].trim()});
+    pos=i+1;
+  }
+  return out;
+}
+
+function enumChoices(swift,type){
+  if(!type) return [];
+  const base=type.replace(/[\[\]?]/g,'').trim();
+  const start=swift.search(new RegExp('enum\\\\s+'+base.replace(/[.*+?^${}()|[\]\\]/g,'\\\\$&')+'\\\\b'));
+  if(start<0) return [];
+  const section=swift.slice(start,start+9000);
+  const rep=section.match(/caseDisplayRepresentations[\s\S]*?=\s*\[([\s\S]*?)\n\s*\]/);
+  if(!rep) return [];
+  const choices=[];
+  const re=/\.[A-Za-z0-9_]+\s*:\s*(?:(?:\.init\(\s*)?title:\s*)?"([^"]+)"/g;
+  let m;
+  while((m=re.exec(rep[1]))) choices.push(unquoteSwift(m[1]));
+  // Simple ".case: "Label"" form
+  const re2=/\.[A-Za-z0-9_]+\s*:\s*"([^"]+)"/g;
+  while((m=re2.exec(rep[1]))) if(!choices.includes(unquoteSwift(m[1]))) choices.push(unquoteSwift(m[1]));
+  return choices;
+}
+
+function parseSwiftEnrichment(swift){
+  const params={};
+  for(const p of balancedParameterBlocks(swift)){
+    const tm=p.args.match(/title\s*:\s*"((?:\\.|[^"])*)"/);
+    if(!tm) continue;
+    const name=unquoteSwift(tm[1]);
+    const dm=p.args.match(/description\s*:\s*"((?:\\.|[^"])*)"/);
+    const def=p.args.match(/\bdefault(?:Value)?\s*:\s*([^,\n)]+)/);
+    params[norm(name)]={
+      sourceName:name,
+      description:dm?unquoteSwift(dm[1]):'',
+      defaultValue:def?def[1].trim().replace(/^\./,''):'',
+      swiftType:p.swiftType,
+      choices:enumChoices(swift,p.swiftType)
+    };
+  }
+  return params;
+}
+
+async function loadForkIndex(){
+  if(forkFiles) return forkFiles;
+  const all=[];
+  for(const dir of FORK_DIRS){
+    try{
+      const url=`https://api.github.com/repos/${FORK_REPO}/contents/${encodeURI(dir)}?ref=${FORK_BRANCH}`;
+      const r=await fetch(url,{headers:{'Accept':'application/vnd.github+json'}});
+      if(!r.ok) continue;
+      const rows=await r.json();
+      for(const f of rows){
+        if(f.type==='file' && f.name.endsWith('.swift')){
+          all.push({name:f.name,path:f.path,download_url:f.download_url,dir});
+        }
+      }
+    }catch(_){}
+  }
+  forkFiles=all;
+  return all;
+}
+
+function filenameCandidates(title){
+  const n=norm(title);
+  return [
+    n,
+    n.replace(/extended$/,'extended'),
+    n.replace(/legacy$/,'')
+  ];
+}
+
+async function enrichAction(a){
+  if(enrichmentCache.has(a.title)) return enrichmentCache.get(a.title);
+  const files=await loadForkIndex();
+  const wanted=filenameCandidates(a.title);
+  let matches=files.filter(f=>wanted.includes(norm(f.name.replace(/\.swift$/,''))));
+  // Prefer Shared implementation when both exist.
+  matches.sort((x,y)=>(x.dir.startsWith('Shared')?-1:1)-(y.dir.startsWith('Shared')?-1:1));
+  let merged={},sources=[];
+  for(const f of matches.slice(0,2)){
+    try{
+      const r=await fetch(f.download_url,{cache:'force-cache'});
+      if(!r.ok) continue;
+      const parsed=parseSwiftEnrichment(await r.text());
+      merged={...parsed,...merged};
+      sources.push(f.path);
+    }catch(_){}
+  }
+  const result={params:merged,sources};
+  enrichmentCache.set(a.title,result);
+  return result;
+}
+
+function fallbackParamNote(name,type){
+  const t=(type||'').toLowerCase();
+  if(t.includes('boolean')) return 'On/off choice. No parameter-specific explanation was recovered from the fork.';
+  if(t.includes('array')) return 'Accepts a list/collection. No parameter-specific explanation was recovered from the fork.';
+  if(t.includes('url')) return 'Accepts a URL. No parameter-specific explanation was recovered from the fork.';
+  if(t.includes('date')) return 'Accepts a date/time value. No parameter-specific explanation was recovered from the fork.';
+  if(t.includes('number')||t.includes('double')||t.includes('int')) return 'Accepts a numeric value. No parameter-specific explanation was recovered from the fork.';
+  if(t.includes('text')||t.includes('string')) return 'Accepts text. No parameter-specific explanation was recovered from the fork.';
+  if(t.includes('file')) return 'Accepts a file or compatible Shortcuts input. No parameter-specific explanation was recovered from the fork.';
+  return 'No parameter-specific explanation was recovered from the fork.';
+}
+
+function entryHTML(raw,enriched){
+  const p=splitParam(raw);
+  const e=enriched?.params?.[norm(p.name)];
+  const desc=e?.description || fallbackParamNote(p.name,p.type);
+  const choices=e?.choices||[];
+  const def=e?.defaultValue||'';
+  return `<div class="entry">
+    <div class="entry-head"><span class="entry-name">${esc(p.name)}</span>${p.type?`<code class="entry-type">${esc(p.type)}</code>`:''}</div>
+    <div class="entry-desc">${esc(desc)}</div>
+    ${choices.length?`<div class="entry-extra"><span class="label">Choices:</span> ${choices.map(esc).join(' · ')}</div>`:''}
+    ${def?`<div class="entry-extra"><span class="label">Default:</span> <code>${esc(def)}</code></div>`:''}
+    <div class="source-note">${e?(e.description?'Recovered from fork source':'Type/default/options recovered from fork source'):'Current parameter; no matching fork description found'}</div>
+  </div>`;
+}
+
+async function populateEntries(details,a){
+  const host=details.querySelector('.entries-host');
+  if(!host || host.dataset.loaded==='1') return;
+  host.innerHTML='<div class="loading-note">Loading recovered entry-option notes…</div>';
+  const enriched=await enrichAction(a);
+  host.dataset.loaded='1';
+  host.innerHTML=`
+    <div class="entry-title">Entry options</div>
+    <div class="entries">${a.parameters.map(p=>entryHTML(p,enriched)).join('')}</div>
+    <div class="enrich-status">${
+      enriched.sources.length
+        ? `Enrichment source: ${enriched.sources.map(esc).join(' + ')}`
+        : 'No matching Swift implementation was found in the recovered fork; type guidance shown where possible.'
+    }</div>`;
+}
+
+function wireDetails(filtered){
+  document.querySelectorAll('details.action').forEach((d,i)=>{
+    d.addEventListener('toggle',()=>{
+      if(d.open) populateEntries(d,filtered[i]);
+    },{passive:true});
+  });
+}
+
+
+function functionalUse(a){
+  const t=a.title.toLowerCase();
+  const notes=[];
+
+  if(t.includes('menu')){
+    notes.push('Use when choices should act as a front-end router or be generated from changing data such as Data Jar keys, JSON records, files, projects, tags, or search results. For a small fixed set of choices, Shortcuts’ built-in Choose from Menu may be simpler.');
+  }
+  if(t.includes('choose') && t.includes('list')){
+    notes.push('Turn a collection produced earlier in the Shortcut into an interactive selector—for example a Data Jar child key, project, vehicle, file, tag, or search result.');
+  }
+  if(t.includes('filter') && t.includes('list')){
+    notes.push('Narrow an existing collection before displaying or processing it—for example keys with a prefix, files with an extension, records with a given status, or nonblank entries.');
+  }
+  if(t.includes('sort') && t.includes('list')){
+    notes.push('Put dynamically collected values into a predictable display or processing order, such as alphabetized keys or numerically ordered results.');
+  }
+  if((t.includes('unique') || t.includes('duplicate')) && t.includes('list')){
+    notes.push('Clean dynamically collected data by identifying or collapsing repeated tags, keys, filenames, or other values before they are presented or processed.');
+  }
+  if((t.includes('chunk') || t.includes('group')) && t.includes('list')){
+    notes.push('Divide a long collection into manageable batches for pagination, grouped menus, or batch file/API processing.');
+  }
+  if(t.includes('random') && t.includes('list')){
+    notes.push('Sample or rotate entries without building your own random-index logic.');
+  }
+  if((t.includes('index') || t.includes('find') || t.includes('contains')) && t.includes('list')){
+    notes.push('Useful when a list is acting as a lookup structure: find whether an item exists or determine its position, then use that position to retrieve a corresponding value from a parallel list.');
+  }
+  if((t.includes('remove') || t.includes('replace') || t.includes('item')) && t.includes('list')){
+    notes.push('Treat a list as a small data structure—for example retrieve an item at a calculated position, remove a completed entry, or replace an outdated value.');
+  }
+  if((t.includes('split') || t.includes('join') || t.includes('line')) && (t.includes('list') || t.includes('text'))){
+    notes.push('Bridge text and lists: turn delimited text into selectable entries or join list values back into text for storage, files, or notifications.');
+  }
+
+  if(notes.length===0 && (t.includes('list') || t.includes('menu'))){
+    notes.push('Part of the list/menu toolbox for building, inspecting, transforming, or presenting collections of values. Pair it with selection, filtering, sorting, lookup, or conversion actions as the workflow requires.');
+  }
+  return notes;
+}
+
+function render(){
+  const q=document.querySelector('#q').value.toLowerCase().trim();
+  const terms=q.split(/\s+/).filter(Boolean);
+
+  const prepared=actions.map(a=>{
+    const usecases=functionalUse(a);
+    const searchable=[
+      a.title,
+      a.description,
+      ...(a.parameters || []),
+      a.returns || '',
+      ...usecases
+    ].join(' ').toLowerCase();
+    return {...a,usecases,searchable};
+  });
+
+  const filtered=prepared.filter(a=>terms.every(term=>a.searchable.includes(term)));
+  document.querySelector('#status').textContent=`${filtered.length} of ${actions.length} actions · R3`;
+
+  document.querySelector('#list').innerHTML=filtered.map(a=>`
+    <details class="action">
+      <summary>${esc(a.title)}</summary>
+      <div class="action-body">
+        <div class="desc">${esc(a.description)}</div>
+        ${a.parameters.length?`<div class="entries-host"><div class="entry-title">Entry options</div><div class="loading-note">Expand action to load recovered option explanations.</div></div>`:''}
+        ${a.returns?`<div class="meta"><span class="label">Returns:</span> <code>${esc(a.returns)}</code></div>`:''}
+        ${a.usecases.length?`
+          <div class="usecase">
+            <div class="usecase-title">Functional use</div>
+            ${a.usecases.map(x=>`<p>${esc(x)}</p>`).join('')}
+          </div>`:''}
+      </div>
+    </details>`).join('');
+  wireDetails(filtered);
+}
+async function load(){
+  document.querySelector('#status').textContent='Loading current Actions reference…';
+  try{
+    const r=await fetch(SOURCE,{cache:'no-store'});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    actions=parse(await r.text());
+    render();
+  }catch(e){
+    document.querySelector('#status').textContent='Could not load source: '+e.message;
+  }
+}
+document.querySelector('#q').addEventListener('input',render);
+document.querySelector('#reload').addEventListener('click',load);
+document.querySelector('#json').addEventListener('click',()=>{
+  const blob=new Blob([JSON.stringify({source:SOURCE,enrichmentSource:'https://github.com/kingfive/Actions',generated:new Date().toISOString(),actions},null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='actions-app-reference.json'; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+});
+load();
+</script>
+</body>
+</html>
